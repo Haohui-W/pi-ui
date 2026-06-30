@@ -7,7 +7,7 @@ on:
 
 jobs:
   desktop:
-    name: Tauri (${{ matrix.platform }})
+    name: Electron (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
     strategy:
       fail-fast: false
@@ -22,26 +22,18 @@ jobs:
           node-version: 22
           cache: npm
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Linux system dependencies
-        if: matrix.platform == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
-
-      - name: Install frontend dependencies
+      - name: Install dependencies
         run: npm ci
 
-      - name: Build Tauri app
-        run: npm run tauri:build
+      - name: Build Electron app
+        run: npm run dist
 
       - name: Upload bundles
         uses: actions/upload-artifact@v4
         with:
           name: pi-ui-${{ matrix.platform }}
           path: |
-            src-tauri/target/release/bundle/**
+            release/**
 
   release:
     needs: desktop

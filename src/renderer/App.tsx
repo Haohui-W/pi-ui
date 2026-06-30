@@ -1,7 +1,5 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type * as React from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import type { RpcAgentMessage, RpcCommand, RpcEnvelope, RpcResponse, RpcSessionState, SessionStats } from "../shared/rpc";
 
 type ViewRole = "system" | "user" | "assistant" | "tool" | "error";
@@ -41,22 +39,19 @@ export function App(): React.JSX.Element {
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const cleanups: Array<() => void> = [];
-    void listen<RpcEnvelope>("pi-rpc", (event) =>
-      applyRpcEnvelope(event.payload, { setSnapshot, setMessages, setTools, setBusy })
-    ).then((unlisten) => cleanups.push(unlisten));
-    void listen<string>("pi-rpc-error", (event) => pushError(setMessages, event.payload)).then((unlisten) =>
-      cleanups.push(unlisten)
-    );
-    void listen<string>("pi-rpc-stderr", (event) => {
-      if (event.payload.trim()) pushError(setMessages, event.payload);
-    }).then((unlisten) => cleanups.push(unlisten));
-    void listen("pi-rpc-exit", () => setBusy(false)).then((unlisten) => cleanups.push(unlisten));
+    const cleanups = [
+      window.pi.onRpc((event) => applyRpcEnvelope(event, { setSnapshot, setMessages, setTools, setBusy })),
+      window.pi.onRpcError((message) => pushError(setMessages, message)),
+      window.pi.onRpcStderr((message) => {
+        if (message.trim()) pushError(setMessages, message);
+      }),
+      window.pi.onRpcExit(() => setBusy(false)),
+    ];
 
     void startSession(false);
     return () => {
       for (const cleanup of cleanups) cleanup();
-      void invoke("stop_rpc");
+      void window.pi.stopRpc();
     };
   }, []);
 
@@ -71,7 +66,7 @@ export function App(): React.JSX.Element {
     setStarting(true);
     try {
       const nextCwd = cwd.trim();
-      await invoke("start_rpc", { options: { cwd: nextCwd || undefined, continueRecent } });
+      await window.pi.startRpc({ cwd: nextCwd || undefined, continueRecent });
       setSnapshot({ cwd: nextCwd || "Current app directory" });
       send({ type: "get_state" });
       send({ type: "get_session_stats" });
@@ -92,7 +87,7 @@ export function App(): React.JSX.Element {
   }
 
   function send(command: RpcCommand): void {
-    void invoke("send_rpc", { command: { id: command.id ?? createId("rpc"), ...command } }).catch((error) => {
+    void window.pi.sendRpc({ id: command.id ?? createId("rpc"), ...command }).catch((error) => {
       pushError(setMessages, formatError(error));
     });
   }
@@ -251,7 +246,7 @@ function applyRpcEnvelope(
   if (event.type === "agent_start") setters.setBusy(true);
   if (event.type === "agent_end") {
     setters.setBusy(false);
-    void invoke("send_rpc", { command: { id: createId("stats"), type: "get_session_stats" } });
+    void window.pi.sendRpc({ id: createId("stats"), type: "get_session_stats" });
   }
   if (event.type === "message_start" && isRpcAgentMessage(event.message)) {
     const message = projectMessage(event.message);
