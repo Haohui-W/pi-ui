@@ -1,8 +1,9 @@
-name: build
+name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 jobs:
   desktop:
@@ -41,3 +42,20 @@ jobs:
           name: pi-ui-${{ matrix.platform }}
           path: |
             src-tauri/target/release/bundle/**
+
+  release:
+    needs: desktop
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
