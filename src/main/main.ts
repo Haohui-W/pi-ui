@@ -17,7 +17,7 @@ function createWindow(): void {
     title: "Pi Agent",
     backgroundColor: "#18181e",
     webPreferences: {
-      preload: join(__dirname, "../preload/preload.js"),
+      preload: join(__dirname, "../preload/preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -28,6 +28,13 @@ function createWindow(): void {
   } else {
     void mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
   }
+
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(`[renderer:load-error] ${errorCode} ${errorDescription} ${validatedURL}`);
+  });
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    console.error(`[renderer:gone] ${details.reason}`);
+  });
 }
 
 app.whenReady().then(() => {
