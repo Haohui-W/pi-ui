@@ -16,3 +16,7 @@ tauri-build = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2", features = [] }
+# cookie 0.18.1 is pulled in by Tauri and is not compatible with time 0.3.52's
+# Parsable::parse signature. Pin a known-compatible time release until upstream
+# dependency bounds catch up.
+time = "=0.3.36"
