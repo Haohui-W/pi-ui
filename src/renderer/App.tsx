@@ -1,8 +1,10 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type * as React from "react";
+import type { PiSessionSummary } from "../shared/ipc";
 import type { RpcAgentMessage, RpcCommand, RpcEnvelope, RpcResponse, RpcSessionState, SessionStats } from "../shared/rpc";
 
 type ViewRole = "system" | "user" | "assistant" | "tool" | "error";
+type WorkspaceMode = "home" | "session";
 
 interface ViewMessage {
   id: string;
@@ -29,13 +31,18 @@ interface Snapshot {
 const initialSnapshot: Snapshot = { cwd: "" };
 
 export function App(): React.JSX.Element {
+  const [mode, setMode] = useState<WorkspaceMode>("home");
+  const [sessions, setSessions] = useState<PiSessionSummary[]>([]);
+  const [folders, setFolders] = useState<string[]>([]);
+  const [selectedFolder, setSelectedFolder] = useState("");
+  const [activeSessionPath, setActiveSessionPath] = useState("");
   const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
   const [messages, setMessages] = useState<ViewMessage[]>([]);
   const [tools, setTools] = useState<ViewTool[]>([]);
   const [prompt, setPrompt] = useState("");
-  const [cwd, setCwd] = useState("");
   const [busy, setBusy] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [loadingSessions, setLoadingSessions] = useState(true);
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -48,7 +55,7 @@ export function App(): React.JSX.Element {
       window.pi.onRpcExit(() => setBusy(false)),
     ];
 
-    void startSession(false);
+    void refreshSessions();
     return () => {
       for (const cleanup of cleanups) cleanup();
       void window.pi.stopRpc();
@@ -59,19 +66,57 @@ export function App(): React.JSX.Element {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
-  const canSend = prompt.trim().length > 0 && !starting;
   const activeTools = useMemo(() => tools.filter((tool) => !tool.endedAt).length, [tools]);
+  const canSend = mode === "session" && prompt.trim().length > 0 && !starting;
+  const groupedSessions = useMemo(() => groupSessionsByCwd(sessions), [sessions]);
 
-  async function startSession(continueRecent: boolean): Promise<void> {
-    setStarting(true);
+  async function refreshSessions(): Promise<void> {
+    setLoadingSessions(true);
     try {
-      const nextCwd = cwd.trim();
-      await window.pi.startRpc({ cwd: nextCwd || undefined, continueRecent });
-      setSnapshot({ cwd: nextCwd || "Current app directory" });
+      const nextSessions = await window.pi.listSessions();
+      setSessions(nextSessions);
+      setFolders((prev) => mergeFolders(prev, nextSessions.map((session) => session.cwd).filter(Boolean)));
+    } catch (error) {
+      pushError(setMessages, formatError(error));
+    } finally {
+      setLoadingSessions(false);
+    }
+  }
+
+  async function pickFolder(): Promise<void> {
+    const folder = await window.pi.pickFolder();
+    if (!folder) return;
+    setFolders((prev) => mergeFolders([folder], prev));
+    setSelectedFolder(folder);
+    setMode("home");
+  }
+
+  async function createSessionFromFolder(folder = selectedFolder): Promise<void> {
+    if (!folder) return;
+    await openSession({ cwd: folder, label: `New session in ${shortPath(folder)}` });
+  }
+
+  async function restoreSession(session: PiSessionSummary): Promise<void> {
+    await openSession({ cwd: session.cwd, sessionPath: session.path, label: `Restored ${session.title}` });
+    setActiveSessionPath(session.path);
+  }
+
+  async function openSession(options: { cwd: string; sessionPath?: string; label: string }): Promise<void> {
+    setStarting(true);
+    setBusy(false);
+    setMessages([]);
+    setTools([]);
+    setSnapshot({ cwd: options.cwd });
+    try {
+      await window.pi.startRpc({ cwd: options.cwd || undefined, sessionPath: options.sessionPath });
+      setMode("session");
+      setActiveSessionPath(options.sessionPath ?? "");
       send({ type: "get_state" });
       send({ type: "get_session_stats" });
-      pushSystem(setMessages, "pi RPC session started");
+      pushSystem(setMessages, options.label);
+      void refreshSessions();
     } catch (error) {
+      setMode("home");
       pushError(setMessages, formatError(error));
     } finally {
       setStarting(false);
@@ -99,73 +144,132 @@ export function App(): React.JSX.Element {
           <div className="brand-mark">pi</div>
           <div>
             <h1>Pi Agent</h1>
-            <p>RPC desktop workbench</p>
+            <p>Desktop</p>
           </div>
         </div>
 
-        <section className="control-block">
-          <label htmlFor="cwd">Working directory</label>
-          <input id="cwd" value={cwd} onChange={(event) => setCwd(event.target.value)} placeholder="Use app directory" />
-          <div className="button-row">
-            <button type="button" onClick={() => startSession(false)} disabled={starting}>
-              New
-            </button>
-            <button type="button" onClick={() => startSession(true)} disabled={starting}>
-              Continue
-            </button>
-          </div>
+        <button className="primary-action" type="button" onClick={pickFolder}>
+          Open Folder
+        </button>
+
+        <section className="nav-block">
+          <header>
+            <span>Projects</span>
+          </header>
+          {folders.length === 0 ? (
+            <p className="muted">Open a folder to start.</p>
+          ) : (
+            folders.map((folder) => (
+              <button
+                className={folder === selectedFolder ? "nav-row selected" : "nav-row"}
+                key={folder}
+                type="button"
+                onClick={() => {
+                  setSelectedFolder(folder);
+                  setMode("home");
+                }}
+              >
+                <span>{folderName(folder)}</span>
+                <small>{shortPath(folder)}</small>
+              </button>
+            ))
+          )}
         </section>
 
-        <SessionMeta snapshot={snapshot} />
+        <section className="nav-block sessions-block">
+          <header>
+            <span>Sessions</span>
+            <button type="button" onClick={() => void refreshSessions()} disabled={loadingSessions}>
+              Refresh
+            </button>
+          </header>
+          {loadingSessions ? <p className="muted">Loading sessions...</p> : null}
+          {!loadingSessions && sessions.length === 0 ? <p className="muted">No pi sessions found.</p> : null}
+          {groupedSessions.map((group) => (
+            <div className="session-group" key={group.cwd}>
+              <h2>{folderName(group.cwd)}</h2>
+              {group.sessions.map((session) => (
+                <button
+                  className={session.path === activeSessionPath ? "session-row selected" : "session-row"}
+                  key={session.path}
+                  type="button"
+                  onClick={() => void restoreSession(session)}
+                  disabled={starting}
+                >
+                  <span>{session.title}</span>
+                  <small>
+                    {formatRelativeTime(session.updatedAt)} · {session.messageCount} messages
+                  </small>
+                </button>
+              ))}
+            </div>
+          ))}
+        </section>
       </aside>
 
       <section className="conversation">
         <header className="topbar">
           <div>
-            <span className={busy ? "status busy" : "status"} />
-            {busy ? "Agent running" : "Ready"}
+            <span className={busy ? "status busy" : mode === "session" ? "status" : "status idle"} />
+            {mode === "session" ? (busy ? "Agent running" : "Session ready") : "Home"}
           </div>
-          <button type="button" onClick={() => send({ type: "abort" })} disabled={!busy}>
-            Abort
-          </button>
+          {mode === "session" ? (
+            <button type="button" onClick={() => send({ type: "abort" })} disabled={!busy}>
+              Abort
+            </button>
+          ) : null}
         </header>
 
-        <div className="messages" ref={listRef}>
-          {messages.length === 0 ? (
-            <div className="empty">
-              <h2>Start a pi RPC session</h2>
-              <p>The desktop app talks to pi through JSONL RPC and keeps the agent engine out of the UI process.</p>
-            </div>
-          ) : (
-            messages.map((message) => <MessageBlock key={message.id} message={message} />)
-          )}
-        </div>
-
-        <form className="composer" onSubmit={submit}>
-          <textarea
-            value={prompt}
-            onChange={(event) => setPrompt(event.target.value)}
-            onKeyDown={(event) => {
-              if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && canSend) {
-                void submit(event);
-              }
-            }}
-            placeholder="Ask pi to inspect, edit, or explain the current project..."
+        {mode === "home" ? (
+          <HomeView
+            selectedFolder={selectedFolder}
+            sessions={selectedFolder ? sessions.filter((session) => session.cwd === selectedFolder) : sessions}
+            starting={starting}
+            onPickFolder={() => void pickFolder()}
+            onCreateSession={() => void createSessionFromFolder()}
+            onRestoreSession={(session) => void restoreSession(session)}
           />
-          <button type="submit" disabled={!canSend}>
-            Send
-          </button>
-        </form>
+        ) : (
+          <>
+            <div className="messages" ref={listRef}>
+              {messages.length === 0 ? (
+                <div className="empty">
+                  <h2>Session is ready</h2>
+                  <p>Send a prompt when you want pi to start working in this folder.</p>
+                </div>
+              ) : (
+                messages.map((message) => <MessageBlock key={message.id} message={message} />)
+              )}
+            </div>
+
+            <form className="composer" onSubmit={submit}>
+              <textarea
+                value={prompt}
+                onChange={(event) => setPrompt(event.target.value)}
+                onKeyDown={(event) => {
+                  if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && canSend) {
+                    void submit(event);
+                  }
+                }}
+                placeholder="Ask pi to inspect, edit, or explain the current project..."
+              />
+              <button type="submit" disabled={!canSend}>
+                Send
+              </button>
+            </form>
+          </>
+        )}
       </section>
 
       <aside className="tools">
         <header>
-          <h2>Tools</h2>
+          <h2>Context</h2>
           <span>{activeTools} running</span>
         </header>
+        <SessionMeta snapshot={snapshot} />
         <div className="tool-list">
           {tools.length === 0 ? (
-            <p className="muted">Tool calls will appear here.</p>
+            <p className="muted">Tool calls will appear here once a session runs.</p>
           ) : (
             tools.map((tool) => <ToolRow key={tool.id} tool={tool} />)
           )}
@@ -175,11 +279,68 @@ export function App(): React.JSX.Element {
   );
 }
 
+function HomeView({
+  selectedFolder,
+  sessions,
+  starting,
+  onPickFolder,
+  onCreateSession,
+  onRestoreSession,
+}: {
+  selectedFolder: string;
+  sessions: PiSessionSummary[];
+  starting: boolean;
+  onPickFolder: () => void;
+  onCreateSession: () => void;
+  onRestoreSession: (session: PiSessionSummary) => void;
+}): React.JSX.Element {
+  return (
+    <div className="home">
+      <section className="hero">
+        <h2>{selectedFolder ? folderName(selectedFolder) : "Pi Agent"}</h2>
+        <p>{selectedFolder ? selectedFolder : "Open a folder or resume a previous pi session to begin."}</p>
+        <div className="home-actions">
+          <button type="button" onClick={onPickFolder}>
+            Open Folder
+          </button>
+          <button type="button" onClick={onCreateSession} disabled={!selectedFolder || starting}>
+            New Session
+          </button>
+        </div>
+      </section>
+
+      <section className="recent">
+        <header>
+          <h3>{selectedFolder ? "Folder Sessions" : "Recent Sessions"}</h3>
+          <span>{sessions.length}</span>
+        </header>
+        {sessions.length === 0 ? (
+          <p className="muted">No sessions for this view yet.</p>
+        ) : (
+          sessions.slice(0, 8).map((session) => (
+            <button className="recent-row" key={session.path} type="button" onClick={() => onRestoreSession(session)}>
+              <strong>{session.title}</strong>
+              <span>{session.firstMessage}</span>
+              <small>
+                {shortPath(session.cwd)} · {formatRelativeTime(session.updatedAt)}
+              </small>
+            </button>
+          ))
+        )}
+      </section>
+    </div>
+  );
+}
+
 function SessionMeta({ snapshot }: { snapshot: Snapshot }): React.JSX.Element {
   const model = snapshot.state?.model;
   const stats = snapshot.stats;
   return (
     <section className="meta">
+      <div>
+        <span>Folder</span>
+        <strong>{snapshot.cwd ? shortPath(snapshot.cwd) : "No session selected"}</strong>
+      </div>
       <div>
         <span>Model</span>
         <strong>{model ? `${model.provider ?? "provider"}/${model.id ?? model.name ?? "model"}` : "Not selected"}</strong>
@@ -195,14 +356,6 @@ function SessionMeta({ snapshot }: { snapshot: Snapshot }): React.JSX.Element {
       <div>
         <span>Tokens</span>
         <strong>{stats ? `in ${formatCount(stats.tokens.input)} / out ${formatCount(stats.tokens.output)}` : "0"}</strong>
-      </div>
-      <div>
-        <span>Context</span>
-        <strong>
-          {stats?.contextUsage?.percent == null
-            ? "unknown"
-            : `${stats.contextUsage.percent.toFixed(1)}% / ${formatCount(stats.contextUsage.contextWindow)}`}
-        </strong>
       </div>
     </section>
   );
@@ -317,6 +470,19 @@ function projectMessage(message: RpcAgentMessage): ViewMessage | undefined {
   return undefined;
 }
 
+function groupSessionsByCwd(sessions: PiSessionSummary[]): Array<{ cwd: string; sessions: PiSessionSummary[] }> {
+  const groups = new Map<string, PiSessionSummary[]>();
+  for (const session of sessions) {
+    const key = session.cwd || "Unknown folder";
+    groups.set(key, [...(groups.get(key) ?? []), session]);
+  }
+  return Array.from(groups, ([cwd, items]) => ({ cwd, sessions: items }));
+}
+
+function mergeFolders(primary: string[], secondary: string[]): string[] {
+  return Array.from(new Set([...primary, ...secondary].filter(Boolean)));
+}
+
 function isRpcResponse(event: RpcEnvelope): event is RpcResponse {
   return event.type === "response" && "command" in event && "success" in event;
 }
@@ -371,6 +537,30 @@ function pushSystem(setMessages: (value: ViewMessage[] | ((prev: ViewMessage[]) 
 
 function pushError(setMessages: (value: ViewMessage[] | ((prev: ViewMessage[]) => ViewMessage[])) => void, text: string): void {
   setMessages((prev) => [...prev, { id: createId("error"), role: "error", text, status: "error" }]);
+}
+
+function folderName(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, "");
+  const parts = normalized.split(/[\\/]/);
+  return parts.at(-1) || path;
+}
+
+function shortPath(path: string): string {
+  const normalized = path.replace(/[\\/]+$/, "");
+  const parts = normalized.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 3) return normalized;
+  return `${parts[0]}/.../${parts.slice(-2).join("/")}`;
+}
+
+function formatRelativeTime(value: string): string {
+  const date = new Date(value);
+  const delta = Date.now() - date.getTime();
+  if (Number.isNaN(delta)) return "unknown";
+  const minutes = Math.max(1, Math.round(delta / 60000));
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) return `${hours}h ago`;
+  return date.toLocaleDateString();
 }
 
 function createId(prefix: string): string {
