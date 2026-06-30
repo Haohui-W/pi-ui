@@ -1,9 +1,9 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import type * as React from "react";
-import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { PiEvent, SessionSnapshot } from "../shared/ipc";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import type { RpcAgentMessage, RpcCommand, RpcEnvelope, RpcResponse, RpcSessionState, SessionStats } from "../shared/rpc";
 
-type SdkMessage = Extract<AgentSessionEvent, { type: "message_start" }>["message"];
 type ViewRole = "system" | "user" | "assistant" | "tool" | "error";
 
 interface ViewMessage {
@@ -22,13 +22,16 @@ interface ViewTool {
   endedAt?: number;
 }
 
-const initialSnapshot: SessionSnapshot = {
-  cwd: "",
-  isStreaming: false
-};
+interface Snapshot {
+  cwd: string;
+  state?: RpcSessionState;
+  stats?: SessionStats;
+}
+
+const initialSnapshot: Snapshot = { cwd: "" };
 
 export function App(): React.JSX.Element {
-  const [snapshot, setSnapshot] = useState<SessionSnapshot>(initialSnapshot);
+  const [snapshot, setSnapshot] = useState<Snapshot>(initialSnapshot);
   const [messages, setMessages] = useState<ViewMessage[]>([]);
   const [tools, setTools] = useState<ViewTool[]>([]);
   const [prompt, setPrompt] = useState("");
@@ -38,11 +41,23 @@ export function App(): React.JSX.Element {
   const listRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    const unsubscribe = window.pi.onEvent((event) => {
-      applyEvent(event, { setSnapshot, setMessages, setTools, setBusy });
-    });
+    const cleanups: Array<() => void> = [];
+    void listen<RpcEnvelope>("pi-rpc", (event) =>
+      applyRpcEnvelope(event.payload, { setSnapshot, setMessages, setTools, setBusy })
+    ).then((unlisten) => cleanups.push(unlisten));
+    void listen<string>("pi-rpc-error", (event) => pushError(setMessages, event.payload)).then((unlisten) =>
+      cleanups.push(unlisten)
+    );
+    void listen<string>("pi-rpc-stderr", (event) => {
+      if (event.payload.trim()) pushError(setMessages, event.payload);
+    }).then((unlisten) => cleanups.push(unlisten));
+    void listen("pi-rpc-exit", () => setBusy(false)).then((unlisten) => cleanups.push(unlisten));
+
     void startSession(false);
-    return unsubscribe;
+    return () => {
+      for (const cleanup of cleanups) cleanup();
+      void invoke("stop_rpc");
+    };
   }, []);
 
   useEffect(() => {
@@ -55,9 +70,14 @@ export function App(): React.JSX.Element {
   async function startSession(continueRecent: boolean): Promise<void> {
     setStarting(true);
     try {
-      const next = await window.pi.startSession({ cwd: cwd.trim() || undefined, continueRecent });
-      setSnapshot(next);
-      if (!cwd) setCwd(next.cwd);
+      const nextCwd = cwd.trim();
+      await invoke("start_rpc", { options: { cwd: nextCwd || undefined, continueRecent } });
+      setSnapshot({ cwd: nextCwd || "Current app directory" });
+      send({ type: "get_state" });
+      send({ type: "get_session_stats" });
+      pushSystem(setMessages, "pi RPC session started");
+    } catch (error) {
+      pushError(setMessages, formatError(error));
     } finally {
       setStarting(false);
     }
@@ -68,17 +88,23 @@ export function App(): React.JSX.Element {
     const text = prompt.trim();
     if (!text) return;
     setPrompt("");
-    await window.pi.sendPrompt(text);
+    send({ type: "prompt", message: text });
+  }
+
+  function send(command: RpcCommand): void {
+    void invoke("send_rpc", { command: { id: command.id ?? createId("rpc"), ...command } }).catch((error) => {
+      pushError(setMessages, formatError(error));
+    });
   }
 
   return (
     <main className="shell">
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">π</div>
+          <div className="brand-mark">pi</div>
           <div>
             <h1>Pi Agent</h1>
-            <p>Desktop workbench</p>
+            <p>RPC desktop workbench</p>
           </div>
         </div>
 
@@ -104,7 +130,7 @@ export function App(): React.JSX.Element {
             <span className={busy ? "status busy" : "status"} />
             {busy ? "Agent running" : "Ready"}
           </div>
-          <button type="button" onClick={() => window.pi.abort()} disabled={!busy}>
+          <button type="button" onClick={() => send({ type: "abort" })} disabled={!busy}>
             Abort
           </button>
         </header>
@@ -112,8 +138,8 @@ export function App(): React.JSX.Element {
         <div className="messages" ref={listRef}>
           {messages.length === 0 ? (
             <div className="empty">
-              <h2>Start a pi session</h2>
-              <p>It uses your existing pi auth, settings, skills, context files, and extensions.</p>
+              <h2>Start a pi RPC session</h2>
+              <p>The desktop app talks to pi through JSONL RPC and keeps the agent engine out of the UI process.</p>
             </div>
           ) : (
             messages.map((message) => <MessageBlock key={message.id} message={message} />)
@@ -154,21 +180,22 @@ export function App(): React.JSX.Element {
   );
 }
 
-function SessionMeta({ snapshot }: { snapshot: SessionSnapshot }): React.JSX.Element {
+function SessionMeta({ snapshot }: { snapshot: Snapshot }): React.JSX.Element {
+  const model = snapshot.state?.model;
   const stats = snapshot.stats;
   return (
     <section className="meta">
       <div>
         <span>Model</span>
-        <strong>{snapshot.model ?? "Not selected"}</strong>
+        <strong>{model ? `${model.provider ?? "provider"}/${model.id ?? model.name ?? "model"}` : "Not selected"}</strong>
       </div>
       <div>
         <span>Thinking</span>
-        <strong>{snapshot.thinkingLevel ?? "off"}</strong>
+        <strong>{snapshot.state?.thinkingLevel ?? "off"}</strong>
       </div>
       <div>
         <span>Session</span>
-        <strong>{snapshot.sessionId ? snapshot.sessionId.slice(0, 8) : "none"}</strong>
+        <strong>{snapshot.state?.sessionId ? snapshot.state.sessionId.slice(0, 8) : "none"}</strong>
       </div>
       <div>
         <span>Tokens</span>
@@ -208,79 +235,81 @@ function ToolRow({ tool }: { tool: ViewTool }): React.JSX.Element {
   );
 }
 
-function applyEvent(
-  event: PiEvent,
+function applyRpcEnvelope(
+  event: RpcEnvelope,
   setters: {
-    setSnapshot: (value: SessionSnapshot | ((prev: SessionSnapshot) => SessionSnapshot)) => void;
+    setSnapshot: (value: Snapshot | ((prev: Snapshot) => Snapshot)) => void;
     setMessages: (value: ViewMessage[] | ((prev: ViewMessage[]) => ViewMessage[])) => void;
     setTools: (value: ViewTool[] | ((prev: ViewTool[]) => ViewTool[])) => void;
     setBusy: (value: boolean) => void;
   }
 ): void {
-  if (event.type === "snapshot") setters.setSnapshot(event.snapshot);
-  if (event.type === "busy") setters.setBusy(event.value);
-  if (event.type === "agent-event") applyAgentEvent(event.event, setters);
-  if (event.type === "error") {
-    setters.setMessages((prev) => [
-      ...prev,
-      {
-        id: `error-${Date.now()}`,
-        role: "error",
-        text: event.message,
-        status: "error"
-      }
-    ]);
-  }
-}
-
-function applyAgentEvent(
-  event: AgentSessionEvent,
-  setters: {
-    setMessages: (value: ViewMessage[] | ((prev: ViewMessage[]) => ViewMessage[])) => void;
-    setTools: (value: ViewTool[] | ((prev: ViewTool[]) => ViewTool[])) => void;
-    setBusy: (value: boolean) => void;
-  }
-): void {
-  if (event.type === "message_start") {
-    const message = projectMessage(event.message);
-    if (message) setters.setMessages((prev) => [...prev, message]);
+  if (isRpcResponse(event)) {
+    applyResponse(event, setters);
     return;
   }
-
+  if (event.type === "agent_start") setters.setBusy(true);
+  if (event.type === "agent_end") {
+    setters.setBusy(false);
+    void invoke("send_rpc", { command: { id: createId("stats"), type: "get_session_stats" } });
+  }
+  if (event.type === "message_start" && isRpcAgentMessage(event.message)) {
+    const message = projectMessage(event.message);
+    if (message) setters.setMessages((prev) => [...prev, message]);
+  }
   if (event.type === "message_update") {
-    const delta = (event.assistantMessageEvent as { delta?: unknown }).delta;
+    const delta =
+      isRecord(event.assistantMessageEvent) && typeof event.assistantMessageEvent.delta === "string"
+        ? event.assistantMessageEvent.delta
+        : undefined;
     if (typeof delta === "string") {
       setters.setMessages((prev) => appendToLastStreamingAssistant(prev, delta));
     }
-    return;
   }
-
-  if (event.type === "message_end" && event.message.role === "assistant") {
-    setters.setMessages((prev) =>
-      prev.map((message, index) =>
-        index === prev.length - 1 && message.role === "assistant" ? { ...message, status: "complete" } : message
-      )
+  if (event.type === "message_end" && isRpcAgentMessage(event.message) && event.message.role === "assistant") {
+    setters.setMessages((prev) => markLastAssistantComplete(prev));
+  }
+  if (event.type === "tool_execution_start" && typeof event.toolCallId === "string" && typeof event.toolName === "string") {
+    const id = event.toolCallId;
+    const name = event.toolName;
+    setters.setTools((prev) => [{ id, name, args: event.args }, ...prev]);
+  }
+  if (event.type === "tool_execution_update" && typeof event.toolCallId === "string") {
+    setters.setTools((prev) =>
+      prev.map((tool) => (tool.id === event.toolCallId ? { ...tool, result: event.partialResult } : tool))
     );
-    return;
   }
-
-  if (event.type === "tool_execution_start") {
-    setters.setTools((prev) => [{ id: event.toolCallId, name: event.toolName, args: event.args }, ...prev]);
-    return;
-  }
-
-  if (event.type === "tool_execution_end") {
+  if (event.type === "tool_execution_end" && typeof event.toolCallId === "string") {
     setters.setTools((prev) =>
       prev.map((tool) =>
         tool.id === event.toolCallId
-          ? { ...tool, result: event.result, isError: event.isError, endedAt: Date.now() }
+          ? { ...tool, result: event.result, isError: event.isError === true, endedAt: Date.now() }
           : tool
       )
     );
   }
 }
 
-function projectMessage(message: SdkMessage): ViewMessage | undefined {
+function applyResponse(
+  response: RpcResponse,
+  setters: {
+    setSnapshot: (value: Snapshot | ((prev: Snapshot) => Snapshot)) => void;
+    setMessages: (value: ViewMessage[] | ((prev: ViewMessage[]) => ViewMessage[])) => void;
+  }
+): void {
+  if (!response.success) {
+    pushError(setters.setMessages, response.error ?? `RPC command failed: ${response.command}`);
+    return;
+  }
+  if (response.command === "get_state") {
+    setters.setSnapshot((prev) => ({ ...prev, state: response.data as unknown as RpcSessionState }));
+  }
+  if (response.command === "get_session_stats") {
+    setters.setSnapshot((prev) => ({ ...prev, stats: response.data as unknown as SessionStats }));
+  }
+}
+
+function projectMessage(message: RpcAgentMessage): ViewMessage | undefined {
   if (message.role === "user") {
     return { id: createId("user"), role: "user", text: extractContentText(message.content), status: "complete" };
   }
@@ -293,6 +322,18 @@ function projectMessage(message: SdkMessage): ViewMessage | undefined {
   return undefined;
 }
 
+function isRpcResponse(event: RpcEnvelope): event is RpcResponse {
+  return event.type === "response" && "command" in event && "success" in event;
+}
+
+function isRpcAgentMessage(value: unknown): value is RpcAgentMessage {
+  return isRecord(value) && typeof value.role === "string";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function appendToLastStreamingAssistant(messages: ViewMessage[], delta: string): ViewMessage[] {
   for (let index = messages.length - 1; index >= 0; index--) {
     const message = messages[index];
@@ -301,6 +342,16 @@ function appendToLastStreamingAssistant(messages: ViewMessage[], delta: string):
     }
   }
   return [...messages, { id: createId("assistant"), role: "assistant", text: delta, status: "streaming" }];
+}
+
+function markLastAssistantComplete(messages: ViewMessage[]): ViewMessage[] {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const message = messages[index];
+    if (message.role === "assistant") {
+      return messages.map((item, itemIndex) => (itemIndex === index ? { ...item, status: "complete" } : item));
+    }
+  }
+  return messages;
 }
 
 function extractContentText(content: unknown): string {
@@ -319,8 +370,20 @@ function extractContentText(content: unknown): string {
     .join("");
 }
 
+function pushSystem(setMessages: (value: ViewMessage[] | ((prev: ViewMessage[]) => ViewMessage[])) => void, text: string): void {
+  setMessages((prev) => [...prev, { id: createId("system"), role: "system", text, status: "complete" }]);
+}
+
+function pushError(setMessages: (value: ViewMessage[] | ((prev: ViewMessage[]) => ViewMessage[])) => void, text: string): void {
+  setMessages((prev) => [...prev, { id: createId("error"), role: "error", text, status: "error" }]);
+}
+
 function createId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatCount(value: number): string {

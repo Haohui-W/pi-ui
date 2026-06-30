@@ -4,23 +4,23 @@
   "private": true,
   "description": "Desktop workbench for pi-agent.",
   "type": "module",
-  "main": "out/main/main.js",
   "scripts": {
-    "dev": "electron-vite dev",
-    "build": "tsc --noEmit && electron-vite build",
-    "preview": "electron-vite preview"
+    "dev:web": "vite",
+    "build:web": "tsc --noEmit && vite build",
+    "tauri": "tauri",
+    "tauri:build": "tauri build",
+    "build": "npm run build:web"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "^0.80.2",
+    "@tauri-apps/api": "^2.0.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.2",
-    "electron": "^39.2.7",
-    "electron-vite": "^4.0.1",
     "typescript": "^5.9.3",
     "vite": "^7.3.0"
   },
