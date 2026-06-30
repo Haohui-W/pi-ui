@@ -16,6 +16,7 @@ export interface PiSessionSummary {
   messageCount: number;
   createdAt: string;
   updatedAt: string;
+  cwdExists: boolean;
 }
 
 export interface PiBridge {

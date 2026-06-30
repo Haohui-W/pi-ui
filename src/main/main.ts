@@ -46,7 +46,7 @@ function emit(channel: string, payload: unknown): void {
 }
 
 ipcMain.handle("pi:start-rpc", (_event, options?: StartRpcOptions) => {
-  startRpc(options ?? {});
+  return startRpc(options ?? {});
 });
 
 ipcMain.handle("pi:send-rpc", (_event, command: RpcCommand) => {
@@ -70,15 +70,17 @@ ipcMain.handle("pi:pick-folder", async () => {
   return result.canceled ? undefined : result.filePaths[0];
 });
 
-function startRpc(options: StartRpcOptions): void {
+async function startRpc(options: StartRpcOptions): Promise<void> {
   stopRpc();
 
   const args = ["--mode", "rpc"];
   if (options.sessionPath) args.push("--session", options.sessionPath);
   if (options.continueRecent) args.push("--continue");
+  const requestedCwd = options.cwd || process.cwd();
+  const spawnCwd = existsSync(requestedCwd) ? requestedCwd : process.cwd();
 
   rpcProcess = spawn(options.piCommand ?? "pi", args, {
-    cwd: options.cwd || process.cwd(),
+    cwd: spawnCwd,
     shell: process.platform === "win32",
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
@@ -92,10 +94,12 @@ function startRpc(options: StartRpcOptions): void {
     emit("pi:rpc-exit", code);
     rpcProcess = null;
   });
+
+  await waitForEarlyRpcFailure(rpcProcess);
 }
 
 async function listSessions(): Promise<PiSessionSummary[]> {
-  const sessionsDir = join(homedir(), ".pi", "agent", "sessions");
+  const sessionsDir = getSessionsRoot();
   if (!existsSync(sessionsDir)) return [];
 
   const files = await findSessionFiles(sessionsDir);
@@ -103,6 +107,13 @@ async function listSessions(): Promise<PiSessionSummary[]> {
   return summaries
     .filter((session): session is PiSessionSummary => session !== undefined)
     .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+}
+
+function getSessionsRoot(): string {
+  return (
+    process.env.PI_CODING_AGENT_SESSION_DIR ||
+    (process.env.PI_CODING_AGENT_DIR ? join(process.env.PI_CODING_AGENT_DIR, "sessions") : join(homedir(), ".pi", "agent", "sessions"))
+  );
 }
 
 async function findSessionFiles(root: string): Promise<string[]> {
@@ -176,10 +187,31 @@ async function readSessionSummary(filePath: string): Promise<PiSessionSummary | 
       messageCount,
       createdAt: createdAt || fileStat.birthtime.toISOString(),
       updatedAt,
+      cwdExists: cwd ? existsSync(cwd) : false,
     };
   } catch {
     return undefined;
   }
+}
+
+function waitForEarlyRpcFailure(child: ChildProcessWithoutNullStreams): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, 400);
+
+    const onError = (error: Error): void => done(error);
+    const onExit = (code: number | null): void => done(new Error(`pi RPC exited during startup with code ${code ?? "unknown"}`));
+
+    function done(error?: Error): void {
+      clearTimeout(timer);
+      child.off("error", onError);
+      child.off("exit", onExit);
+      if (error) reject(error);
+      else resolve();
+    }
+
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
 }
 
 function extractMessageText(content: unknown): string {

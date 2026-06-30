@@ -66,6 +66,12 @@ export function App(): React.JSX.Element {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
 
+  useEffect(() => {
+    if (snapshot.state?.sessionFile) {
+      setActiveSessionPath(snapshot.state.sessionFile);
+    }
+  }, [snapshot.state?.sessionFile]);
+
   const activeTools = useMemo(() => tools.filter((tool) => !tool.endedAt).length, [tools]);
   const canSend = mode === "session" && prompt.trim().length > 0 && !starting;
   const groupedSessions = useMemo(() => groupSessionsByCwd(sessions), [sessions]);
@@ -97,6 +103,12 @@ export function App(): React.JSX.Element {
   }
 
   async function restoreSession(session: PiSessionSummary): Promise<void> {
+    if (!session.cwdExists) {
+      setSelectedFolder("");
+      setMode("home");
+      pushError(setMessages, `Session folder no longer exists: ${session.cwd}. Open the folder again before restoring this session.`);
+      return;
+    }
     await openSession({ cwd: session.cwd, sessionPath: session.path, label: `Restored ${session.title}` });
     setActiveSessionPath(session.path);
   }
@@ -113,6 +125,7 @@ export function App(): React.JSX.Element {
       setActiveSessionPath(options.sessionPath ?? "");
       send({ type: "get_state" });
       send({ type: "get_session_stats" });
+      send({ type: "get_messages" });
       pushSystem(setMessages, options.label);
       void refreshSessions();
     } catch (error) {
@@ -199,6 +212,7 @@ export function App(): React.JSX.Element {
                   <span>{session.title}</span>
                   <small>
                     {formatRelativeTime(session.updatedAt)} · {session.messageCount} messages
+                    {session.cwdExists ? "" : " · missing folder"}
                   </small>
                 </button>
               ))}
@@ -323,6 +337,7 @@ function HomeView({
               <span>{session.firstMessage}</span>
               <small>
                 {shortPath(session.cwd)} · {formatRelativeTime(session.updatedAt)}
+                {session.cwdExists ? "" : " · missing folder"}
               </small>
             </button>
           ))
@@ -455,14 +470,31 @@ function applyResponse(
   if (response.command === "get_session_stats") {
     setters.setSnapshot((prev) => ({ ...prev, stats: response.data as unknown as SessionStats }));
   }
+  if (response.command === "get_messages") {
+    const data = response.data as { messages?: unknown } | undefined;
+    const messages = Array.isArray(data?.messages) ? data.messages : [];
+    setters.setMessages((prev) => [
+      ...prev,
+      ...messages.flatMap((message) => {
+        if (!isRpcAgentMessage(message)) return [];
+        const projected = projectMessage(message, true);
+        return projected ? [projected] : [];
+      }),
+    ]);
+  }
 }
 
-function projectMessage(message: RpcAgentMessage): ViewMessage | undefined {
+function projectMessage(message: RpcAgentMessage, complete = false): ViewMessage | undefined {
   if (message.role === "user") {
     return { id: createId("user"), role: "user", text: extractContentText(message.content), status: "complete" };
   }
   if (message.role === "assistant") {
-    return { id: createId("assistant"), role: "assistant", text: extractContentText(message.content), status: "streaming" };
+    return {
+      id: createId("assistant"),
+      role: "assistant",
+      text: extractContentText(message.content),
+      status: complete ? "complete" : "streaming",
+    };
   }
   if (message.role === "toolResult") {
     return { id: createId("tool"), role: "tool", text: extractContentText(message.content), status: "complete" };
